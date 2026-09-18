@@ -96,10 +96,12 @@ kanban:
   release_approval:
     enabled: true
     promotion_argv:
-      - python3
-      - /opt/cuto/deploy/hermes-release-adapter.py
+      - sudo
+      - -n
+      - --
+      - /usr/local/libexec/cuto-release-boundary
       - --config
-      - /etc/cuto/hermes-release-adapter.json
+      - /etc/cuto-release-orchestrator/runtime.json
 ```
 
 The release publisher first calls
