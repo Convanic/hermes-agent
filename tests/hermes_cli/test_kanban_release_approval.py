@@ -6,6 +6,8 @@ import sys
 import threading
 from pathlib import Path
 
+import pytest
+
 from hermes_cli import kanban_db as kb
 from hermes_cli.kanban_db_connect import connect
 
@@ -144,7 +146,7 @@ def test_non_exact_text_and_changed_current_release_state_fail_closed(tmp_path, 
         assert not calls.exists()
 
 
-def test_expired_promoting_claim_stays_fail_closed(tmp_path, monkeypatch):
+def test_expired_promoting_claim_resumes_with_same_operation_key(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
     kb.init_db()
     calls = tmp_path / "calls.jsonl"
@@ -161,9 +163,158 @@ def test_expired_promoting_claim_stays_fail_closed(tmp_path, monkeypatch):
         )
         conn.execute("UPDATE kanban_release_gates SET gate_status='consuming' WHERE id=?", (gate.gate_id,))
         conn.commit()
+        operation_key = _operation_key(row)
         result = _approve(conn, _adapter(tmp_path, calls), now=100)
-        assert not result.ok and result.classification == "in_progress"
-        assert not calls.exists()
+        assert result.ok and result.classification == "success"
+        argv = json.loads(calls.read_text().splitlines()[0])
+        assert argv[1] == "resume"
+        assert argv[argv.index("--operation-key") + 1] == operation_key
+        saga = conn.execute(
+            "SELECT state,operation_key,adapter_receipt FROM kanban_release_sagas WHERE gate_id=?",
+            (gate.gate_id,),
+        ).fetchone()
+        assert (saga["state"], saga["operation_key"]) == ("succeeded", operation_key)
+        assert json.loads(saga["adapter_receipt"])["release_id"] == gate.release_id
+
+
+def test_present_release_cannot_replace_claimed_gate_during_adapter_io(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+    db = kb.init_db()
+    adapter_started = threading.Event()
+    release_adapter = threading.Event()
+    calls = []
+
+    def blocked_adapter(command, **_kwargs):
+        calls.append(command)
+        adapter_started.set()
+        assert release_adapter.wait(timeout=5)
+        release_id = command[command.index("--release-id") + 1]
+        receipt = {
+            "ok": True,
+            "release_id": release_id,
+            "dev": {"result": "success", "active_release_id": release_id},
+            "test": {"result": "success", "active_release_id": release_id},
+            "production": {"result": "success", "active_release_id": release_id},
+            "previous_release_id": "2026.09.17-02+old",
+            "rollback_available": True,
+        }
+        return type("Completed", (), {"stdout": json.dumps(receipt)})()
+
+    monkeypatch.setattr("hermes_cli.kanban_release_approval.subprocess.run", blocked_adapter)
+    with connect(db) as conn:
+        task = kb.create_task(conn, title="Release race")
+        old_gate = _present(conn, task, release="release-old", message="old-message")
+
+    results = []
+
+    def approve_old():
+        with connect(db) as conn:
+            results.append(_approve(conn, ["adapter"], message="old-message", now=100))
+
+    thread = threading.Thread(target=approve_old)
+    thread.start()
+    assert adapter_started.wait(timeout=5)
+    try:
+        with connect(db) as conn:
+            with pytest.raises(RuntimeError, match="promotion is in progress"):
+                _present(conn, task, release="release-new", message="new-message")
+            current = conn.execute(
+                "SELECT gate_status FROM kanban_release_gates WHERE id=?", (old_gate.gate_id,)
+            ).fetchone()
+            assert current["gate_status"] == "consuming"
+            state = conn.execute(
+                "SELECT active_dev_release_id FROM kanban_release_state WHERE task_id=?", (task,)
+            ).fetchone()
+            assert state["active_dev_release_id"] == "release-old"
+            from hermes_cli.kanban_release_approval import update_release_state
+            with pytest.raises(RuntimeError, match="promotion is in progress"):
+                update_release_state(
+                    conn,
+                    task_id=task,
+                    workflow_status="Auf Dev zur Prüfung",
+                    active_dev_release_id="release-new",
+                    manifest_sha256="c" * 64,
+                )
+    finally:
+        release_adapter.set()
+        thread.join(timeout=5)
+
+    assert not thread.is_alive()
+    assert len(calls) == 1
+    assert calls[0][calls[0].index("--release-id") + 1] == "release-old"
+    assert results[0].ok is True
+
+
+def test_failure_user_message_is_nontechnical_and_reports_release_state():
+    from hermes_cli.kanban_release_approval import ApprovalResult
+
+    result = ApprovalResult(
+        ok=False,
+        classification="stale_after_promotion",
+        release_id="release-1",
+        dev_result="success",
+        test_result="failed",
+        production_result="not_started",
+        active_release_id="release-0",
+        previous_release_id="release-prev",
+        rollback_available=True,
+    )
+
+    message = result.user_message()
+    assert message.startswith("Fehler: ")
+    assert "stale_after_promotion" not in message
+    assert "Release-ID: release-1" in message
+    assert "Dev: success" in message
+    assert "Test: failed" in message
+    assert "Prod: not_started" in message
+    assert "Aktiv: release-0" in message
+    assert "Vorgänger: release-prev" in message
+    assert "Rollback verfügbar: ja" in message
+
+
+def test_ambiguous_adapter_failure_stays_consuming_and_retries_as_resume(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+    kb.init_db()
+    commands = []
+
+    def flaky_adapter(command, **_kwargs):
+        commands.append(command)
+        if len(commands) == 1:
+            raise OSError("adapter connection lost")
+        release_id = command[command.index("--release-id") + 1]
+        receipt = {
+            "ok": True,
+            "release_id": release_id,
+            "dev": {"result": "success", "active_release_id": release_id},
+            "test": {"result": "success", "active_release_id": release_id},
+            "production": {"result": "success", "active_release_id": release_id},
+            "previous_release_id": "release-old",
+            "rollback_available": True,
+        }
+        return type("Completed", (), {"stdout": json.dumps(receipt)})()
+
+    monkeypatch.setattr("hermes_cli.kanban_release_approval.subprocess.run", flaky_adapter)
+    with connect() as conn:
+        task = kb.create_task(conn, title="Ambiguous adapter")
+        gate = _present(conn, task)
+        first = _approve(conn, ["adapter"], now=100)
+        assert not first.ok and first.classification == "adapter_failed"
+        assert first.active_release_id is None
+        persisted = conn.execute(
+            "SELECT g.gate_status,s.state,s.operation_key FROM kanban_release_gates g "
+            "JOIN kanban_release_sagas s ON s.gate_id=g.id WHERE g.id=?",
+            (gate.gate_id,),
+        ).fetchone()
+        assert (persisted["gate_status"], persisted["state"]) == ("consuming", "promoting")
+
+        second = _approve(conn, ["adapter"], now=101)
+        assert second.ok
+        assert [command[1] for command in commands] == ["promote", "resume"]
+        assert (
+            commands[0][commands[0].index("--operation-key") + 1]
+            == commands[1][commands[1].index("--operation-key") + 1]
+            == persisted["operation_key"]
+        )
 
 
 def test_parallel_double_delivery_invokes_adapter_once(tmp_path, monkeypatch):

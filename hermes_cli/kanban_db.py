@@ -1090,8 +1090,8 @@ CREATE TABLE IF NOT EXISTS kanban_release_state (
 );
 
 -- Persisted idempotent saga. The adapter receives operation_key and must treat
--- retries with that key as the same promotion. A promoting claim is never stolen
--- by another approval delivery, even after its diagnostic lease expires.
+-- retries with that key as the same promotion. A live promoting claim is never
+-- stolen; an expired claim is resumed through the adapter with the same key.
 CREATE TABLE IF NOT EXISTS kanban_release_sagas (
     operation_key   TEXT PRIMARY KEY,
     gate_id         TEXT NOT NULL UNIQUE,

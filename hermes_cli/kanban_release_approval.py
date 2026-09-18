@@ -58,7 +58,7 @@ class ApprovalResult:
         release = self.release_id or "unbekannt"
         active = self.active_release_id or "unbekannt"
         rollback = "ja" if self.rollback_available else "nein"
-        prefix = "Freigabe verarbeitet" if self.ok else f"Freigabe abgelehnt ({self.classification})"
+        prefix = "Freigabe verarbeitet" if self.ok else "Fehler: Freigabe konnte nicht verarbeitet werden"
         return (
             f"{prefix}. Release-ID: {release}. Dev: {self.dev_result}. "
             f"Test: {self.test_result}. Prod: {self.production_result}. "
@@ -112,6 +112,12 @@ def present_release(
     with write_txn(conn):
         if conn.execute("SELECT 1 FROM tasks WHERE id=?", (fields["task_id"],)).fetchone() is None:
             raise ValueError("task does not exist")
+        if conn.execute(
+            "SELECT 1 FROM kanban_release_gates WHERE platform=? AND chat_id=? AND thread_id=? "
+            "AND actor_id=? AND gate_status='consuming'",
+            (fields["platform"], fields["chat_id"], thread_id, fields["actor_id"]),
+        ).fetchone() is not None:
+            raise RuntimeError("release promotion is in progress for this approval route")
         conn.execute(
             "INSERT INTO kanban_release_state "
             "(task_id,workflow_status,active_dev_release_id,manifest_sha256,updated_at) "
@@ -155,6 +161,11 @@ def update_release_state(
     with write_txn(conn):
         if conn.execute("SELECT 1 FROM tasks WHERE id=?", (task_id,)).fetchone() is None:
             raise ValueError("task does not exist")
+        if conn.execute(
+            "SELECT 1 FROM kanban_release_gates WHERE task_id=? AND gate_status='consuming'",
+            (task_id,),
+        ).fetchone() is not None:
+            raise RuntimeError("release promotion is in progress for this task")
         conn.execute(
             "INSERT INTO kanban_release_state "
             "(task_id,workflow_status,active_dev_release_id,manifest_sha256,updated_at) "
@@ -218,12 +229,14 @@ def _claim(conn, text: str, context: ApprovalContext, now: int):
         saga = conn.execute("SELECT * FROM kanban_release_sagas WHERE gate_id=?", (gate["id"],)).fetchone()
         if saga is not None and saga["state"] == "succeeded":
             return None, _result("replay", gate)
-        if saga is not None and saga["state"] == "promoting":
-            # A timed-out local worker is ambiguous: the external adapter may
-            # still have completed. Approval delivery never steals the claim;
-            # an operator must reconcile the stable operation key first.
+        if (saga is not None and saga["state"] == "promoting"
+                and saga["lease_expires"] is not None and saga["lease_expires"] > now):
+            # The current owner may still be mutating the external targets.
+            # Once its lease expires, retry enters the adapter's explicit
+            # resume/reconcile action with this same operation key.
             return None, _result("in_progress", gate)
         owner = secrets.token_hex(16)
+        action = "promote" if saga is None else "resume"
         if saga is None:
             conn.execute(
                 "INSERT INTO kanban_release_sagas "
@@ -238,13 +251,15 @@ def _claim(conn, text: str, context: ApprovalContext, now: int):
                 (owner, now + _LEASE_SECONDS, now, op_key),
             )
         conn.execute("UPDATE kanban_release_gates SET gate_status='consuming' WHERE id=?", (gate["id"],))
-        return (gate, op_key, owner), None
+        return (gate, op_key, owner, action), None
 
 
-def _adapter_receipt(promotion_argv: Sequence[str], gate, operation_key: str) -> dict:
+def _adapter_receipt(
+    promotion_argv: Sequence[str], gate, operation_key: str, *, action: str = "promote",
+) -> dict:
     if not promotion_argv or not all(isinstance(value, str) and value for value in promotion_argv):
         raise ValueError("promotion adapter argv is not configured")
-    command = [*promotion_argv, "promote", "--task-id", gate["task_id"],
+    command = [*promotion_argv, action, "--task-id", gate["task_id"],
                "--release-id", gate["release_id"], "--manifest-sha256", gate["manifest_sha256"],
                "--operation-key", operation_key]
     completed = subprocess.run(command, stdin=subprocess.DEVNULL, capture_output=True, text=True,
@@ -289,25 +304,41 @@ def process_approval(
         return early
     if claim is None:  # defensive: _claim returns either a claim or a result
         return _result("stale_approval")
-    gate, operation_key, owner = claim
+    gate, operation_key, owner, action = claim
     try:
-        receipt = _adapter_receipt(promotion_argv, gate, operation_key)
+        receipt = _adapter_receipt(promotion_argv, gate, operation_key, action=action)
     except (OSError, subprocess.SubprocessError, ValueError, json.JSONDecodeError):
         with write_txn(conn):
             conn.execute(
-                "UPDATE kanban_release_sagas SET state='failed',error_class='adapter',lease_expires=NULL,"
+                "UPDATE kanban_release_sagas SET error_class='adapter',lease_expires=?,"
                 "updated_at=? WHERE operation_key=? AND owner_token=?",
-                (timestamp, operation_key, owner),
+                (timestamp, timestamp, operation_key, owner),
             )
-            conn.execute("UPDATE kanban_release_gates SET gate_status='active' "
-                         "WHERE id=? AND gate_status='consuming'", (gate["id"],))
-        return _result("adapter_failed", gate, detail="Promotion failed closed; retry is safe with the same operation key.")
+        return ApprovalResult(
+            ok=False,
+            classification="adapter_failed",
+            release_id=gate["release_id"],
+            previous_release_id=gate["previous_release_id"],
+            rollback_available=bool(gate["rollback_available"]),
+            detail="Promotion outcome is unknown; retry resumes with the same operation key.",
+        )
 
     encoded = json.dumps(receipt, sort_keys=True, separators=(",", ":"))
     with write_txn(conn):
-        current = conn.execute("SELECT * FROM kanban_release_gates WHERE id=?", (gate["id"],)).fetchone()
+        current = conn.execute(
+            "SELECT g.*, t.status AS task_status, s.workflow_status AS current_workflow_status, "
+            "s.active_dev_release_id AS current_active_dev_release_id, "
+            "s.manifest_sha256 AS current_manifest_sha256 FROM kanban_release_gates g "
+            "JOIN tasks t ON t.id=g.task_id LEFT JOIN kanban_release_state s ON s.task_id=g.task_id "
+            "WHERE g.id=?",
+            (gate["id"],),
+        ).fetchone()
         saga = conn.execute("SELECT * FROM kanban_release_sagas WHERE operation_key=?", (operation_key,)).fetchone()
-        if (current is None or current["gate_status"] != "consuming" or saga is None
+        if (current is None or current["gate_status"] != "consuming"
+                or current["current_workflow_status"] != _REVIEW_STATUS
+                or current["current_active_dev_release_id"] != gate["release_id"]
+                or current["current_manifest_sha256"] != gate["manifest_sha256"]
+                or current["task_status"] in {"done", "archived"} or saga is None
                 or saga["owner_token"] != owner or saga["state"] != "promoting"):
             if saga is not None and saga["owner_token"] == owner:
                 conn.execute("UPDATE kanban_release_sagas SET state='failed',error_class='stale_after_promotion',"
