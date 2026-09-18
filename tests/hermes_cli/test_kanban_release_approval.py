@@ -46,9 +46,11 @@ def _adapter(tmp_path: Path, calls: Path) -> list[str]:
     script.write_text(
         "import json,sys\n"
         f"p={str(calls)!r}\n"
-        "open(p,'a',encoding='utf-8').write(json.dumps(sys.argv[1:])+'\\n')\n"
+        "trusted=json.load(sys.stdin)\n"
+        "open(p,'a',encoding='utf-8').write(json.dumps({'argv':sys.argv[1:],'trusted':trusted})+'\\n')\n"
         "a=sys.argv; rid=a[a.index('--release-id')+1]\n"
-        "print(json.dumps({'ok':True,'release_id':rid,'dev':{'result':'success','active_release_id':rid},"
+        "op=a[a.index('--operation-key')+1]\n"
+        "print(json.dumps({'ok':True,'contract_version':'cuto-hermes-release/v1','operation_key':op,'release_id':rid,'dev':{'result':'success','active_release_id':rid},"
         "'test':{'result':'success','active_release_id':rid},'production':{'result':'success','active_release_id':rid},"
         "'previous_release_id':'2026.09.17-02+old','rollback_available':True}))\n"
     )
@@ -83,10 +85,16 @@ def test_release_approval_is_bound_and_executes_literal_argv(tmp_path, monkeypat
         assert result.previous_release_id == "2026.09.17-02+old"
         assert result.rollback_available is True
         assert result.dev_result == result.test_result == result.production_result == "success"
-        argv = json.loads(calls.read_text().splitlines()[0])
+        call = json.loads(calls.read_text().splitlines()[0])
+        argv = call["argv"]
         assert argv[:2] == ["literal ; $(not-shell)", "promote"]
         assert argv[argv.index("--task-id") + 1] == task
         assert argv[argv.index("--release-id") + 1] == gate.release_id
+        assert "armin-1" not in argv and "b" * 64 not in argv
+        assert call["trusted"]["actor_subject"] == "armin-1"
+        assert call["trusted"]["manual_test_cases_sha256"] == "b" * 64
+        assert call["trusted"]["contract_version"] == "cuto-hermes-release/v1"
+        assert call["trusted"]["approval_id"].startswith("hermes:")
         assert len(calls.read_text().splitlines()) == 1
 
 
@@ -175,7 +183,7 @@ def test_expired_promoting_claim_resumes_with_same_operation_key(tmp_path, monke
         operation_key = _operation_key(row)
         result = _approve(conn, _adapter(tmp_path, calls), now=100)
         assert result.ok and result.classification == "success"
-        argv = json.loads(calls.read_text().splitlines()[0])
+        argv = json.loads(calls.read_text().splitlines()[0])["argv"]
         assert argv[1] == "resume"
         assert argv[argv.index("--operation-key") + 1] == operation_key
         saga = conn.execute(
@@ -200,6 +208,8 @@ def test_present_release_cannot_replace_claimed_task_from_another_route(tmp_path
         release_id = command[command.index("--release-id") + 1]
         receipt = {
             "ok": True,
+            "contract_version": "cuto-hermes-release/v1",
+            "operation_key": command[command.index("--operation-key") + 1],
             "release_id": release_id,
             "dev": {"result": "success", "active_release_id": release_id},
             "test": {"result": "success", "active_release_id": release_id},
@@ -301,6 +311,8 @@ def test_ambiguous_adapter_failure_stays_consuming_and_retries_as_resume(tmp_pat
         release_id = command[command.index("--release-id") + 1]
         receipt = {
             "ok": True,
+            "contract_version": "cuto-hermes-release/v1",
+            "operation_key": command[command.index("--operation-key") + 1],
             "release_id": release_id,
             "dev": {"result": "success", "active_release_id": release_id},
             "test": {"result": "success", "active_release_id": release_id},
@@ -332,6 +344,46 @@ def test_ambiguous_adapter_failure_stays_consuming_and_retries_as_resume(tmp_pat
             == commands[1][commands[1].index("--operation-key") + 1]
             == persisted["operation_key"]
         )
+
+
+def test_readback_verified_failure_is_persisted_and_resumes(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+    kb.init_db()
+    calls = []
+
+    def adapter(command, **kwargs):
+        trusted = json.loads(kwargs["input"])
+        calls.append((command, trusted))
+        release_id = command[command.index("--release-id") + 1]
+        operation_key = command[command.index("--operation-key") + 1]
+        successful = len(calls) == 2
+        receipt = {
+            "ok": True,
+            "contract_version": "cuto-hermes-release/v1",
+            "operation_key": operation_key,
+            "release_id": release_id,
+            "dev": {"result": "success", "active_release_id": release_id},
+            "test": {"result": "success", "active_release_id": release_id},
+            "production": {
+                "result": "success" if successful else "failed",
+                "active_release_id": release_id if successful else "release-old",
+            },
+            "previous_release_id": "release-old",
+            "rollback_available": True,
+        }
+        return type("Completed", (), {"stdout": json.dumps(receipt)})()
+
+    monkeypatch.setattr("hermes_cli.kanban_release_approval.subprocess.run", adapter)
+    with connect() as conn:
+        task = kb.create_task(conn, title="Known failure")
+        _present(conn, task)
+        first = _approve(conn, ["adapter"], now=100)
+        assert not first.ok and first.classification == "promotion_failed"
+        assert first.production_result == "failed"
+        second = _approve(conn, ["adapter"], now=101)
+        assert second.ok
+        assert [call[0][1] for call in calls] == ["promote", "resume"]
+        assert calls[0][1] == calls[1][1]
 
 
 def test_parallel_double_delivery_invokes_adapter_once(tmp_path, monkeypatch):

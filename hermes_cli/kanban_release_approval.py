@@ -20,8 +20,10 @@ from hermes_cli.kanban_db_connect import write_txn
 _APPROVAL_TEXT = "freigegeben"
 _REVIEW_STATUS = "Auf Dev zur Prüfung"
 _DIGEST = re.compile(r"[0-9a-f]{64}")
-_LEASE_SECONDS = 60
+_ACTOR_SUBJECT = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]{2,255}")
+_LEASE_SECONDS = 7700
 _RESULT_WORDS = {"success", "failed", "not_started", "skipped", "active", "rolled_back"}
+_ADAPTER_CONTRACT_VERSION = "cuto-hermes-release/v1"
 
 
 @dataclass(frozen=True)
@@ -98,6 +100,8 @@ def present_release(
         "chat_id": chat_id, "actor_id": actor_id, "presented_message_id": presented_message_id,
     }
     fields = {name: _required(value, name) for name, value in fields.items()}
+    if _ACTOR_SUBJECT.fullmatch(fields["actor_id"]) is None:
+        raise ValueError("actor_id must be an authenticated opaque subject")
     manifest_sha256 = str(manifest_sha256 or "").lower()
     manual_test_cases_digest = str(manual_test_cases_digest or "").lower()
     if not _DIGEST.fullmatch(manifest_sha256) or not _DIGEST.fullmatch(manual_test_cases_digest):
@@ -195,6 +199,11 @@ def _operation_key(gate) -> str:
     return "release-approval:" + hashlib.sha256(bound.encode()).hexdigest()
 
 
+def _approval_id(gate) -> str:
+    """Return a stable dispatcher-owned ID without exposing route identifiers."""
+    return "hermes:" + hashlib.sha256(gate["id"].encode()).hexdigest()
+
+
 def _claim(conn, text: str, context: ApprovalContext, now: int):
     if text != _APPROVAL_TEXT:
         return None, _result("not_approval")
@@ -263,10 +272,19 @@ def _adapter_receipt(
     command = [*promotion_argv, action, "--task-id", gate["task_id"],
                "--release-id", gate["release_id"], "--manifest-sha256", gate["manifest_sha256"],
                "--operation-key", operation_key]
-    completed = subprocess.run(command, stdin=subprocess.DEVNULL, capture_output=True, text=True,
-                               encoding="utf-8", errors="replace", timeout=300, check=True)
+    trusted_input = json.dumps({
+        "approval_id": _approval_id(gate),
+        "actor_subject": gate["actor_id"],
+        "contract_version": _ADAPTER_CONTRACT_VERSION,
+        "manual_test_cases_sha256": gate["manual_test_cases_digest"],
+    }, sort_keys=True, separators=(",", ":")) + "\n"
+    completed = subprocess.run(command, input=trusted_input, capture_output=True, text=True,
+                               encoding="utf-8", errors="replace", timeout=7600, check=True)
     receipt = json.loads(completed.stdout)
-    if not isinstance(receipt, dict) or receipt.get("ok") is not True or receipt.get("release_id") != gate["release_id"]:
+    if (not isinstance(receipt, dict) or receipt.get("ok") is not True
+            or receipt.get("contract_version") != _ADAPTER_CONTRACT_VERSION
+            or receipt.get("operation_key") != operation_key
+            or receipt.get("release_id") != gate["release_id"]):
         raise ValueError("promotion adapter returned an invalid release receipt")
     for target in ("dev", "test", "production"):
         state = receipt.get(target)
@@ -325,6 +343,11 @@ def process_approval(
         )
 
     encoded = json.dumps(receipt, sort_keys=True, separators=(",", ":"))
+    promotion_succeeded = all(
+        receipt[target]["result"] == "success"
+        and receipt[target].get("active_release_id") == gate["release_id"]
+        for target in ("dev", "test", "production")
+    )
     with write_txn(conn):
         current = conn.execute(
             "SELECT g.*, t.status AS task_status, s.workflow_status AS current_workflow_status, "
@@ -346,6 +369,12 @@ def process_approval(
                              "adapter_receipt=?,lease_expires=NULL,updated_at=? WHERE operation_key=?",
                              (encoded, timestamp, operation_key))
             return _from_receipt(False, "stale_after_promotion", gate, receipt)
+        if not promotion_succeeded:
+            conn.execute("UPDATE kanban_release_sagas SET state='failed',error_class='promotion_failed',"
+                         "adapter_receipt=?,lease_expires=NULL,updated_at=? "
+                         "WHERE operation_key=? AND owner_token=?",
+                         (encoded, timestamp, operation_key, owner))
+            return _from_receipt(False, "promotion_failed", gate, receipt)
         conn.execute("UPDATE kanban_release_sagas SET state='succeeded',adapter_receipt=?,"
                      "lease_expires=NULL,updated_at=? WHERE operation_key=? AND owner_token=?",
                      (encoded, timestamp, operation_key, owner))

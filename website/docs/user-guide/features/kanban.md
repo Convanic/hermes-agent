@@ -96,9 +96,10 @@ kanban:
   release_approval:
     enabled: true
     promotion_argv:
-      - /opt/cuto/bin/promote-release
+      - python3
+      - /opt/cuto/deploy/hermes-release-adapter.py
       - --config
-      - /etc/cuto/promotion.yaml
+      - /etc/cuto/hermes-release-adapter.json
 ```
 
 The release publisher first calls
@@ -114,7 +115,10 @@ Hermes rechecks `Auf Dev zur Prüfung`, active Dev release, task, actor, route,
 message and manifest under `BEGIN IMMEDIATE`, then persists a stable operation
 key before invoking the adapter. The adapter receives literal arguments
 `promote --task-id ... --release-id ... --manifest-sha256 ... --operation-key ...`
-and returns JSON containing release ID; Dev/Test/Production result and actual
+plus contract `cuto-hermes-release/v1`. Hermes sends the claims-bound actor,
+manual-test digest and dispatcher-owned approval ID only as bounded JSON on
+stdin, never in argv. The adapter returns read-back JSON containing release ID;
+Dev/Test/Production result and actual
 active release; predecessor; and rollback availability. It must treat the
 operation key idempotently. SQLite claim/finalize transactions plus that adapter
 contract form a persisted fail-closed saga, not a global ACID transaction.
