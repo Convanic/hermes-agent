@@ -12,7 +12,16 @@ from hermes_cli import kanban_db as kb
 from hermes_cli.kanban_db_connect import connect
 
 
-def _present(conn, task_id: str, *, release: str = "2026.09.18-01+abc", message: str = "m1"):
+def _present(
+    conn,
+    task_id: str,
+    *,
+    release: str = "2026.09.18-01+abc",
+    message: str = "m1",
+    chat_id: str = "chat-1",
+    thread_id: str = "",
+    actor_id: str = "armin-1",
+):
     from hermes_cli.kanban_release_approval import present_release
     return present_release(
         conn,
@@ -23,9 +32,9 @@ def _present(conn, task_id: str, *, release: str = "2026.09.18-01+abc", message:
         workflow_status="Auf Dev zur Prüfung",
         active_dev_release_id=release,
         platform="telegram",
-        chat_id="chat-1",
-        thread_id="",
-        actor_id="armin-1",
+        chat_id=chat_id,
+        thread_id=thread_id,
+        actor_id=actor_id,
         presented_message_id=message,
         previous_release_id="2026.09.17-02+old",
         rollback_available=True,
@@ -177,7 +186,7 @@ def test_expired_promoting_claim_resumes_with_same_operation_key(tmp_path, monke
         assert json.loads(saga["adapter_receipt"])["release_id"] == gate.release_id
 
 
-def test_present_release_cannot_replace_claimed_gate_during_adapter_io(tmp_path, monkeypatch):
+def test_present_release_cannot_replace_claimed_task_from_another_route(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
     db = kb.init_db()
     adapter_started = threading.Event()
@@ -217,7 +226,15 @@ def test_present_release_cannot_replace_claimed_gate_during_adapter_io(tmp_path,
     try:
         with connect(db) as conn:
             with pytest.raises(RuntimeError, match="promotion is in progress"):
-                _present(conn, task, release="release-new", message="new-message")
+                _present(
+                    conn,
+                    task,
+                    release="release-new",
+                    message="new-message",
+                    chat_id="chat-2",
+                    thread_id="thread-2",
+                    actor_id="armin-2",
+                )
             current = conn.execute(
                 "SELECT gate_status FROM kanban_release_gates WHERE id=?", (old_gate.gate_id,)
             ).fetchone()

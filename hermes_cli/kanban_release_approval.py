@@ -113,11 +113,12 @@ def present_release(
         if conn.execute("SELECT 1 FROM tasks WHERE id=?", (fields["task_id"],)).fetchone() is None:
             raise ValueError("task does not exist")
         if conn.execute(
-            "SELECT 1 FROM kanban_release_gates WHERE platform=? AND chat_id=? AND thread_id=? "
-            "AND actor_id=? AND gate_status='consuming'",
-            (fields["platform"], fields["chat_id"], thread_id, fields["actor_id"]),
+            "SELECT 1 FROM kanban_release_gates WHERE gate_status='consuming' AND "
+            "(task_id=? OR (platform=? AND chat_id=? AND thread_id=? AND actor_id=?))",
+            (fields["task_id"], fields["platform"], fields["chat_id"], thread_id,
+             fields["actor_id"]),
         ).fetchone() is not None:
-            raise RuntimeError("release promotion is in progress for this approval route")
+            raise RuntimeError("release promotion is in progress for this task or approval route")
         conn.execute(
             "INSERT INTO kanban_release_state "
             "(task_id,workflow_status,active_dev_release_id,manifest_sha256,updated_at) "
