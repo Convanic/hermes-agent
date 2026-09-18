@@ -96,10 +96,12 @@ kanban:
   release_approval:
     enabled: true
     promotion_argv:
-      - python3
-      - /opt/cuto/deploy/hermes-release-adapter.py
+      - sudo
+      - -n
+      - --
+      - /usr/local/libexec/cuto-release-boundary
       - --config
-      - /etc/cuto/hermes-release-adapter.json
+      - /etc/cuto-release-orchestrator/runtime.json
 ```
 
 The release publisher first calls
@@ -113,7 +115,12 @@ state rather than the presentation snapshot.
 
 Hermes rechecks `Auf Dev zur Prüfung`, active Dev release, task, actor, route,
 message and manifest under `BEGIN IMMEDIATE`, then persists a stable operation
-key before invoking the adapter. The adapter receives literal arguments
+key before invoking the adapter. The fixed root boundary atomically binds that
+key together with task, release and manifest digest to the selected immutable
+runtime before its first adapter execution. Retries and resume therefore verify
+and reuse the original source/content-digest runtime even after a newer runtime
+has been selected; missing, mismatched, tampered or ambiguous bindings fail
+closed. The adapter receives literal arguments
 `promote --task-id ... --release-id ... --manifest-sha256 ... --operation-key ...`
 plus contract `cuto-hermes-release/v1`. Hermes sends the claims-bound actor,
 manual-test digest and dispatcher-owned approval ID only as bounded JSON on
