@@ -53,7 +53,7 @@ class GatewayInboundMixin:
             return False, None
         argv = release.get("promotion_argv")
         if not isinstance(argv, list) or not argv or not all(isinstance(v, str) and v for v in argv):
-            return True, "Fehler: Freigabe konnte nicht verarbeitet werden. Release-ID: unbekannt. Dev: not_started. Test: not_started. Prod: not_started. Aktiv: unbekannt. Vorgänger: keiner. Rollback verfügbar: nein."
+            return True, "Fehler: Freigabe konnte nicht verarbeitet werden. Release-ID: unbekannt. Dev: unbekannt. Test: unbekannt. Prod: unbekannt. Aktiv: unbekannt. Vorgänger: unbekannt. Rollback verfügbar: unbekannt."
         from hermes_cli.kanban_release_approval import (
             ApprovalContext, process_current_board_approval,
         )

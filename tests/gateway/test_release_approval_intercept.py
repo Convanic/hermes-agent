@@ -91,6 +91,35 @@ def test_non_exact_or_disabled_reply_is_not_consumed(monkeypatch):
     )) == (False, None)
 
 
+def test_enabled_reply_without_valid_promotion_adapter_reports_unknown_state(monkeypatch):
+    source = _source()
+    event = MessageEvent(text="freigegeben", source=source)
+
+    for promotion_argv in ([], ["/opt/bin/promote", ""]):
+        monkeypatch.setattr(
+            "hermes_cli.config_effective.load_user_config_effective",
+            lambda argv=promotion_argv: {"kanban": {"release_approval": {
+                "enabled": True,
+                "promotion_argv": argv,
+            }}},
+        )
+
+        handled, reply = asyncio.run(
+            GatewayInboundMixin()._hm_release_approval_intercept(event, source)
+        )
+
+        assert handled is True
+        assert reply is not None
+        assert "Release-ID: unbekannt" in reply
+        assert "Dev: unbekannt" in reply
+        assert "Test: unbekannt" in reply
+        assert "Prod: unbekannt" in reply
+        assert "Aktiv: unbekannt" in reply
+        assert "Vorgänger: unbekannt" in reply
+        assert "Rollback verfügbar: unbekannt" in reply
+        assert "not_started" not in reply
+
+
 class _BusyAdapter(BasePlatformAdapter):
     def __init__(self):
         super().__init__(PlatformConfig(enabled=True, token="test"), Platform.TELEGRAM)
