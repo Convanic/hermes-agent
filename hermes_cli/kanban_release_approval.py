@@ -239,7 +239,9 @@ def _claim(conn, text: str, context: ApprovalContext, now: int):
             )
         gate = rows[0]
         if gate["gate_status"] == "approved":
-            return None, _result("replay", gate)
+            return None, _result(
+                "replay", gate, active_release_id=route_active_release_id
+            )
         if (gate["gate_status"] not in {"active", "consuming"}
                 or gate["workflow_status"] != _REVIEW_STATUS
                 or gate["active_dev_release_id"] != gate["release_id"]

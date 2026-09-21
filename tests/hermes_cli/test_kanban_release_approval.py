@@ -113,6 +113,46 @@ def test_stale_release_replay_and_task_switch_fail_closed(tmp_path, monkeypatch)
         assert len(calls.read_text().splitlines()) == 1
 
 
+def test_approved_release_replay_after_task_switch_reports_current_route_state(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+    kb.init_db()
+    calls = tmp_path / "calls.jsonl"
+    argv = _adapter(tmp_path, calls)
+    with connect() as conn:
+        old_task = kb.create_task(conn, title="Old")
+        old_gate = _present(
+            conn,
+            old_task,
+            release="release-old",
+            message="old-message",
+        )
+        accepted = _approve(conn, argv, message="old-message")
+        assert accepted.ok
+
+        new_task = kb.create_task(conn, title="New")
+        _present(
+            conn,
+            new_task,
+            release="release-new",
+            message="new-message",
+        )
+
+        replay = _approve(conn, argv, message="old-message", now=101)
+        assert not replay.ok and replay.classification == "replay"
+        assert replay.release_id == old_gate.release_id
+        assert replay.active_release_id == "release-new"
+        assert replay.previous_release_id is None
+        assert replay.rollback_available is None
+        assert replay.dev_result == replay.test_result == replay.production_result == "unknown"
+        assert "Aktiv: release-new" in replay.user_message()
+        assert "Aktiv: release-old" not in replay.user_message()
+        assert "Vorgänger: unbekannt" in replay.user_message()
+        assert "Rollback verfügbar: unbekannt" in replay.user_message()
+        assert len(calls.read_text().splitlines()) == 1
+
+
 def test_manifest_dev_state_and_workflow_status_are_rechecked(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
     kb.init_db()
