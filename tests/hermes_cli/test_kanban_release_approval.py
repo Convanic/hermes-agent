@@ -103,6 +103,9 @@ def test_stale_release_replay_and_task_switch_fail_closed(tmp_path, monkeypatch)
 
         switched = _approve(conn, argv, message="old-message")
         assert not switched.ok and switched.classification == "stale_approval"
+        assert switched.active_release_id == "2026.09.18-02+def"
+        assert switched.previous_release_id is None
+        assert switched.rollback_available is None
         accepted = _approve(conn, argv, message="new-message")
         assert accepted.ok
         replay = _approve(conn, argv, message="new-message", now=101)
@@ -152,6 +155,16 @@ def test_non_exact_text_and_changed_current_release_state_fail_closed(tmp_path, 
         stale = _approve(conn, argv, now=101)
         assert not stale.ok and stale.classification == "stale_approval"
         assert stale.release_id == gate.release_id
+        assert stale.active_release_id == "replacement"
+        assert stale.previous_release_id is None
+        assert stale.rollback_available is None
+        assert stale.dev_result == stale.test_result == stale.production_result == "unknown"
+        message = stale.user_message()
+        assert "Dev: unbekannt. Test: unbekannt. Prod: unbekannt." in message
+        assert "Aktiv: replacement" in message
+        assert "Vorgänger: unbekannt" in message
+        assert "Rollback verfügbar: unbekannt" in message
+        assert "not_started" not in message
         assert not calls.exists()
 
 
@@ -317,6 +330,14 @@ def test_ambiguous_adapter_failure_stays_consuming_and_retries_as_resume(tmp_pat
         first = _approve(conn, ["adapter"], now=100)
         assert not first.ok and first.classification == "adapter_failed"
         assert first.active_release_id is None
+        assert first.previous_release_id is None
+        assert first.rollback_available is None
+        assert first.dev_result == first.test_result == first.production_result == "unknown"
+        message = first.user_message()
+        assert "Aktiv: unbekannt" in message
+        assert "Vorgänger: unbekannt" in message
+        assert "Rollback verfügbar: unbekannt" in message
+        assert "not_started" not in message
         persisted = conn.execute(
             "SELECT g.gate_status,s.state,s.operation_key FROM kanban_release_gates g "
             "JOIN kanban_release_sagas s ON s.gate_id=g.id WHERE g.id=?",
@@ -332,6 +353,36 @@ def test_ambiguous_adapter_failure_stays_consuming_and_retries_as_resume(tmp_pat
             == commands[1][commands[1].index("--operation-key") + 1]
             == persisted["operation_key"]
         )
+
+
+def test_success_without_rollback_evidence_reports_unknown(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+    kb.init_db()
+
+    def adapter_without_rollback(command, **_kwargs):
+        release_id = command[command.index("--release-id") + 1]
+        receipt = {
+            "ok": True,
+            "release_id": release_id,
+            "dev": {"result": "success", "active_release_id": release_id},
+            "test": {"result": "success", "active_release_id": release_id},
+            "production": {"result": "success", "active_release_id": release_id},
+        }
+        return type("Completed", (), {"stdout": json.dumps(receipt)})()
+
+    monkeypatch.setattr(
+        "hermes_cli.kanban_release_approval.subprocess.run", adapter_without_rollback
+    )
+    with connect() as conn:
+        task = kb.create_task(conn, title="No rollback evidence")
+        _present(conn, task)
+        result = _approve(conn, ["adapter"], now=100)
+
+    assert result.ok
+    assert result.previous_release_id is None
+    assert result.rollback_available is None
+    assert "Vorgänger: unbekannt" in result.user_message()
+    assert "Rollback verfügbar: unbekannt" in result.user_message()
 
 
 def test_parallel_double_delivery_invokes_adapter_once(tmp_path, monkeypatch):

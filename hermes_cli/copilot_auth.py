@@ -9,7 +9,6 @@ import json
 import logging
 import os
 import re
-import shutil
 import subprocess
 import threading
 import time
@@ -87,17 +86,13 @@ def resolve_copilot_token() -> tuple[str, str]:
 
 
 def _gh_cli_candidates() -> list[str]:
-    """Configured client, else PATH-resolved ``gh`` plus common Homebrew installs."""
+    """Configured client, otherwise exclusively the PATH-resolved ``gh``."""
     from hermes_cli.github_cli import resolve_gh_binary
     configured = os.environ.get("HERMES_GH_BIN", "").strip()
     if configured:
         return [configured]
     resolved = resolve_gh_binary()
-    candidates: list[str] = [resolved] if resolved else []
-    candidates += [
-        c for c in ("/opt/homebrew/bin/gh", "/usr/local/bin/gh", str(Path.home() / ".local/bin/gh"))
-        if c not in candidates and os.path.isfile(c) and os.access(c, os.X_OK)]
-    return candidates
+    return [resolved] if resolved else []
 
 
 # ``gh auth token`` cache (misses too). With no credential store the probe blocks its full 5s on

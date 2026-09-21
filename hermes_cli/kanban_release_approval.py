@@ -46,23 +46,31 @@ class ApprovalResult:
     ok: bool
     classification: str
     release_id: str | None = None
-    dev_result: str = "not_started"
-    test_result: str = "not_started"
-    production_result: str = "not_started"
+    dev_result: str = "unknown"
+    test_result: str = "unknown"
+    production_result: str = "unknown"
     active_release_id: str | None = None
     previous_release_id: str | None = None
-    rollback_available: bool = False
+    rollback_available: bool | None = None
     detail: str = ""
 
     def user_message(self) -> str:
         release = self.release_id or "unbekannt"
         active = self.active_release_id or "unbekannt"
-        rollback = "ja" if self.rollback_available else "nein"
+        dev = "unbekannt" if self.dev_result == "unknown" else self.dev_result
+        test = "unbekannt" if self.test_result == "unknown" else self.test_result
+        production = (
+            "unbekannt" if self.production_result == "unknown" else self.production_result
+        )
+        rollback = (
+            "unbekannt" if self.rollback_available is None
+            else "ja" if self.rollback_available else "nein"
+        )
         prefix = "Freigabe verarbeitet" if self.ok else "Fehler: Freigabe konnte nicht verarbeitet werden"
         return (
-            f"{prefix}. Release-ID: {release}. Dev: {self.dev_result}. "
-            f"Test: {self.test_result}. Prod: {self.production_result}. "
-            f"Aktiv: {active}. Vorgänger: {self.previous_release_id or 'keiner'}. "
+            f"{prefix}. Release-ID: {release}. Dev: {dev}. "
+            f"Test: {test}. Prod: {production}. "
+            f"Aktiv: {active}. Vorgänger: {self.previous_release_id or 'unbekannt'}. "
             f"Rollback verfügbar: {rollback}."
         )
 
@@ -178,13 +186,15 @@ def update_release_state(
 
 
 def _result(classification: str, gate=None, **kwargs) -> ApprovalResult:
+    active_release_id = kwargs.pop(
+        "active_release_id",
+        gate["current_active_dev_release_id"] if gate is not None else None,
+    )
     return ApprovalResult(
         ok=False,
         classification=classification,
         release_id=gate["release_id"] if gate is not None else None,
-        active_release_id=gate["active_dev_release_id"] if gate is not None else None,
-        previous_release_id=gate["previous_release_id"] if gate is not None else None,
-        rollback_available=bool(gate["rollback_available"]) if gate is not None else False,
+        active_release_id=active_release_id,
         **kwargs,
     )
 
@@ -211,8 +221,22 @@ def _claim(conn, text: str, context: ApprovalContext, now: int):
             (context.platform, context.chat_id, context.thread_id or "", context.actor_id,
              context.reply_to_message_id),
         ).fetchall()
+        route_state = conn.execute(
+            "SELECT s.active_dev_release_id FROM kanban_release_gates g "
+            "JOIN kanban_release_state s ON s.task_id=g.task_id "
+            "WHERE g.platform=? AND g.chat_id=? AND g.thread_id=? AND g.actor_id=? "
+            "AND g.gate_status IN ('active','consuming') "
+            "AND s.active_dev_release_id=g.release_id "
+            "ORDER BY g.presented_at DESC,g.id DESC LIMIT 1",
+            (context.platform, context.chat_id, context.thread_id or "", context.actor_id),
+        ).fetchone()
+        route_active_release_id = (
+            route_state["active_dev_release_id"] if route_state is not None else None
+        )
         if len(rows) != 1:
-            return None, _result("stale_approval")
+            return None, _result(
+                "stale_approval", active_release_id=route_active_release_id
+            )
         gate = rows[0]
         if gate["gate_status"] == "approved":
             return None, _result("replay", gate)
@@ -225,7 +249,13 @@ def _claim(conn, text: str, context: ApprovalContext, now: int):
                 or gate["task_status"] in {"done", "archived"}
                 or not _DIGEST.fullmatch(gate["manifest_sha256"])
                 or not _DIGEST.fullmatch(gate["manual_test_cases_digest"])):
-            return None, _result("stale_approval", gate)
+            return None, _result(
+                "stale_approval",
+                gate,
+                active_release_id=(
+                    route_active_release_id or gate["current_active_dev_release_id"]
+                ),
+            )
         op_key = _operation_key(gate)
         saga = conn.execute("SELECT * FROM kanban_release_sagas WHERE gate_id=?", (gate["id"],)).fetchone()
         if saga is not None and saga["state"] == "succeeded":
@@ -274,6 +304,9 @@ def _adapter_receipt(
             raise ValueError(f"promotion adapter omitted {target} state")
     if receipt["dev"].get("active_release_id") != gate["release_id"]:
         raise ValueError("promotion adapter did not read back the approved Dev release")
+    rollback_available = receipt.get("rollback_available")
+    if rollback_available is not None and not isinstance(rollback_available, bool):
+        raise ValueError("promotion adapter returned invalid rollback availability")
     return receipt
 
 
@@ -286,7 +319,12 @@ def _from_receipt(ok: bool, classification: str, gate, receipt: dict, detail: st
                           or receipt["test"].get("active_release_id")
                           or receipt["dev"].get("active_release_id"),
         previous_release_id=receipt.get("previous_release_id"),
-        rollback_available=bool(receipt.get("rollback_available")), detail=detail,
+        rollback_available=(
+            receipt.get("rollback_available")
+            if isinstance(receipt.get("rollback_available"), bool)
+            else None
+        ),
+        detail=detail,
     )
 
 
@@ -319,8 +357,6 @@ def process_approval(
             ok=False,
             classification="adapter_failed",
             release_id=gate["release_id"],
-            previous_release_id=gate["previous_release_id"],
-            rollback_available=bool(gate["rollback_available"]),
             detail="Promotion outcome is unknown; retry resumes with the same operation key.",
         )
 

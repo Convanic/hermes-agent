@@ -97,6 +97,16 @@ class TestGhCliTokenCache:
         from hermes_cli.copilot_auth import _invalidate_gh_cli_token_cache
         _invalidate_gh_cli_token_cache()
 
+    def test_candidates_do_not_probe_hardcoded_paths(self, monkeypatch):
+        from hermes_cli import copilot_auth
+
+        monkeypatch.delenv("HERMES_GH_BIN", raising=False)
+        with patch("hermes_cli.github_cli.shutil.which", return_value=None), patch.object(
+            copilot_auth.os.path, "isfile", return_value=True
+        ) as isfile:
+            assert copilot_auth._gh_cli_candidates() == []
+        isfile.assert_not_called()
+
     def test_miss_is_cached_and_probe_runs_once(self):
         from hermes_cli import copilot_auth
         self._reset()
