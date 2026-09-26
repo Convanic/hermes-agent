@@ -14,7 +14,7 @@ import secrets
 import subprocess
 import time
 from dataclasses import dataclass
-from typing import Sequence
+from typing import Mapping, Sequence
 
 from hermes_cli.kanban_db_connect import write_txn
 
@@ -23,8 +23,16 @@ _REVIEW_STATUS = "Auf Dev zur Prüfung"
 _DIGEST = re.compile(r"[0-9a-f]{64}")
 _ACTOR_SUBJECT = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]{2,255}")
 _LEASE_SECONDS = 7700
-_RESULT_WORDS = {"success", "failed", "not_started", "skipped", "active", "rolled_back"}
 _ADAPTER_CONTRACT_VERSION = "cuto-hermes-release/v1"
+_SOURCE_COMMIT = re.compile(r"[0-9a-f]{40}")
+_ARTIFACT_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}")
+_RECEIPT_FIELDS = {
+    "ok", "contract_version", "operation_key", "task_id", "release_id",
+    "manifest_sha256", "manual_test_cases_sha256", "source_commit",
+    "workflow_run_id", "bundle_sha256", "artifacts", "dev", "test",
+    "production", "previous_release_id", "rollback_available",
+    "database_restore_attempted",
+}
 
 
 @dataclass(frozen=True)
@@ -85,6 +93,19 @@ def _required(value: str, name: str) -> str:
     return value
 
 
+def _artifact_digests(value: Mapping[str, str]) -> dict[str, str]:
+    if not isinstance(value, Mapping) or not value:
+        raise ValueError("artifact_digests must be a non-empty mapping")
+    result: dict[str, str] = {}
+    for name, digest in value.items():
+        if not isinstance(name, str) or _ARTIFACT_NAME.fullmatch(name) is None:
+            raise ValueError("artifact_digests contains an invalid artifact name")
+        if not isinstance(digest, str) or _DIGEST.fullmatch(digest) is None:
+            raise ValueError("artifact_digests must contain lowercase SHA-256 values")
+        result[name] = digest
+    return dict(sorted(result.items()))
+
+
 def present_release(
     conn,
     *,
@@ -92,6 +113,9 @@ def present_release(
     release_id: str,
     manifest_sha256: str,
     manual_test_cases_digest: str,
+    source_commit: str,
+    bundle_sha256: str,
+    artifact_digests: Mapping[str, str],
     workflow_status: str,
     active_dev_release_id: str,
     platform: str,
@@ -115,6 +139,21 @@ def present_release(
     manual_test_cases_digest = str(manual_test_cases_digest or "").lower()
     if not _DIGEST.fullmatch(manifest_sha256) or not _DIGEST.fullmatch(manual_test_cases_digest):
         raise ValueError("manifest and manual-test digests must be lowercase SHA-256 values")
+    source_commit = str(source_commit or "").lower()
+    bundle_sha256 = str(bundle_sha256 or "").lower()
+    if _SOURCE_COMMIT.fullmatch(source_commit) is None:
+        raise ValueError("source_commit must be a lowercase 40-character commit SHA")
+    if _DIGEST.fullmatch(bundle_sha256) is None:
+        raise ValueError("bundle_sha256 must be a lowercase SHA-256 value")
+    artifacts_json = json.dumps(
+        _artifact_digests(artifact_digests), sort_keys=True, separators=(",", ":")
+    )
+    if previous_release_id is not None:
+        previous_release_id = _required(previous_release_id, "previous_release_id")
+        if previous_release_id == fields["release_id"]:
+            raise ValueError("previous release must differ from the presented release")
+    if bool(rollback_available) != (previous_release_id is not None):
+        raise ValueError("rollback availability must match the verified previous release")
     if workflow_status != _REVIEW_STATUS:
         raise ValueError(f"workflow_status must be {_REVIEW_STATUS!r}")
     if active_dev_release_id != fields["release_id"]:
@@ -148,12 +187,14 @@ def present_release(
         )
         conn.execute(
             "INSERT INTO kanban_release_gates "
-            "(id,task_id,release_id,manifest_sha256,manual_test_cases_digest,workflow_status,"
+            "(id,task_id,release_id,manifest_sha256,manual_test_cases_digest,source_commit,"
+            "bundle_sha256,artifact_digests_json,workflow_status,"
             "active_dev_release_id,platform,chat_id,thread_id,actor_id,presented_message_id,"
             "presented_at,previous_release_id,rollback_available,gate_status) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'active')",
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'active')",
             (gate_id, fields["task_id"], fields["release_id"], manifest_sha256,
-             manual_test_cases_digest, workflow_status, active_dev_release_id,
+             manual_test_cases_digest, source_commit, bundle_sha256, artifacts_json,
+             workflow_status, active_dev_release_id,
              fields["platform"], fields["chat_id"], thread_id, fields["actor_id"],
              fields["presented_message_id"], now, previous_release_id,
              int(bool(rollback_available))),
@@ -205,8 +246,11 @@ def _result(classification: str, gate=None, **kwargs) -> ApprovalResult:
 
 
 def _operation_key(gate) -> str:
-    bound = "\0".join((gate["id"], gate["task_id"], gate["release_id"], gate["manifest_sha256"],
-                        gate["actor_id"], gate["presented_message_id"]))
+    bound = "\0".join((
+        gate["id"], gate["task_id"], gate["release_id"], gate["manifest_sha256"],
+        gate["manual_test_cases_digest"], gate["source_commit"], gate["bundle_sha256"],
+        gate["artifact_digests_json"], gate["actor_id"], gate["presented_message_id"],
+    ))
     return "release-approval:" + hashlib.sha256(bound.encode()).hexdigest()
 
 
@@ -297,6 +341,87 @@ def _claim(conn, text: str, context: ApprovalContext, now: int):
         return (gate, op_key, owner, action), None
 
 
+def _validate_receipt(receipt: object, gate, operation_key: str) -> dict:
+    if not isinstance(receipt, dict) or set(receipt) != _RECEIPT_FIELDS:
+        raise ValueError("promotion adapter returned an invalid release receipt schema")
+    expected_identity = {
+        "ok": True,
+        "contract_version": _ADAPTER_CONTRACT_VERSION,
+        "operation_key": operation_key,
+        "task_id": gate["task_id"],
+        "release_id": gate["release_id"],
+        "manifest_sha256": gate["manifest_sha256"],
+        "manual_test_cases_sha256": gate["manual_test_cases_digest"],
+        "source_commit": gate["source_commit"],
+        "bundle_sha256": gate["bundle_sha256"],
+        "database_restore_attempted": False,
+    }
+    if any(receipt.get(field) != value for field, value in expected_identity.items()):
+        raise ValueError("promotion adapter receipt identity differs from the approval gate")
+    workflow_run_id = receipt.get("workflow_run_id")
+    if not isinstance(workflow_run_id, str) or not workflow_run_id.isdigit():
+        raise ValueError("promotion adapter returned an invalid workflow run ID")
+
+    raw_artifacts = receipt.get("artifacts")
+    if not isinstance(raw_artifacts, dict) or not raw_artifacts:
+        raise ValueError("promotion adapter omitted artifact digests")
+    if any(
+        not isinstance(name, str)
+        or _ARTIFACT_NAME.fullmatch(name) is None
+        or not isinstance(value, dict)
+        or set(value) != {"sha256"}
+        or not isinstance(value.get("sha256"), str)
+        or _DIGEST.fullmatch(value["sha256"]) is None
+        for name, value in raw_artifacts.items()
+    ):
+        raise ValueError("promotion adapter returned invalid artifact digests")
+    actual_artifacts = {name: value["sha256"] for name, value in raw_artifacts.items()}
+    if actual_artifacts != json.loads(gate["artifact_digests_json"]):
+        raise ValueError("promotion adapter substituted an unapproved artifact")
+
+    states = {}
+    for target in ("dev", "test", "production"):
+        state = receipt.get(target)
+        if (not isinstance(state, dict) or set(state) != {"result", "active_release_id"}
+                or state.get("result") not in {"success", "failed", "not_started"}):
+            raise ValueError(f"promotion adapter returned invalid {target} state")
+        active = state.get("active_release_id")
+        if active is not None and (not isinstance(active, str) or not active or active == "unknown"):
+            raise ValueError(f"promotion adapter returned unknown {target} active state")
+        states[target] = (state["result"], active)
+
+    release_id = gate["release_id"]
+    if states["dev"] != ("success", release_id):
+        raise ValueError("promotion adapter did not read back the approved Dev release")
+    test_result, test_active = states["test"]
+    production_result, production_active = states["production"]
+    if test_result == "success":
+        if test_active != release_id or production_result not in {"success", "failed"}:
+            raise ValueError("promotion adapter returned an invalid Test-to-Production transition")
+        if production_result == "success" and production_active != release_id:
+            raise ValueError("promotion adapter did not read back the Production release")
+        if production_result == "failed" and production_active == release_id:
+            raise ValueError("Production failure did not prove candidate compensation")
+    elif test_result == "failed":
+        if test_active == release_id or states["production"] != ("not_started", test_active):
+            raise ValueError("Test failure did not prove Production was left unchanged")
+    else:
+        raise ValueError("promotion adapter did not attempt the approved Test release")
+
+    previous = receipt.get("previous_release_id")
+    rollback_available = receipt.get("rollback_available")
+    if (previous is not None and (not isinstance(previous, str) or not previous
+                                  or previous == release_id)
+            or not isinstance(rollback_available, bool)
+            or rollback_available != (previous is not None)
+            or previous != gate["previous_release_id"]
+            or rollback_available != bool(gate["rollback_available"])):
+        raise ValueError("promotion adapter returned unverified previous-release rollback state")
+    if production_active != release_id and production_active != previous:
+        raise ValueError("promotion adapter previous release differs from Production read-back")
+    return receipt
+
+
 def _adapter_receipt(
     promotion_argv: Sequence[str], gate, operation_key: str, *, action: str = "promote",
 ) -> dict:
@@ -320,22 +445,7 @@ def _adapter_receipt(
     completed = subprocess.run(command, input=trusted_input, capture_output=True, text=True,
                                encoding="utf-8", errors="replace", timeout=7600, check=True,
                                env=adapter_env)
-    receipt = json.loads(completed.stdout)
-    if (not isinstance(receipt, dict) or receipt.get("ok") is not True
-            or receipt.get("contract_version") != _ADAPTER_CONTRACT_VERSION
-            or receipt.get("operation_key") != operation_key
-            or receipt.get("release_id") != gate["release_id"]):
-        raise ValueError("promotion adapter returned an invalid release receipt")
-    for target in ("dev", "test", "production"):
-        state = receipt.get(target)
-        if not isinstance(state, dict) or state.get("result") not in _RESULT_WORDS:
-            raise ValueError(f"promotion adapter omitted {target} state")
-    if receipt["dev"].get("active_release_id") != gate["release_id"]:
-        raise ValueError("promotion adapter did not read back the approved Dev release")
-    rollback_available = receipt.get("rollback_available")
-    if rollback_available is not None and not isinstance(rollback_available, bool):
-        raise ValueError("promotion adapter returned invalid rollback availability")
-    return receipt
+    return _validate_receipt(json.loads(completed.stdout), gate, operation_key)
 
 
 def _from_receipt(ok: bool, classification: str, gate, receipt: dict, detail: str = "") -> ApprovalResult:

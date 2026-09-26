@@ -29,6 +29,9 @@ def _present(
         release_id=release,
         manifest_sha256="a" * 64,
         manual_test_cases_digest="b" * 64,
+        source_commit="c" * 40,
+        bundle_sha256="d" * 64,
+        artifact_digests={"php": "e" * 64, "react": "f" * 64, "caddy": "1" * 64},
         workflow_status="Auf Dev zur Prüfung",
         active_dev_release_id=release,
         platform="telegram",
@@ -48,11 +51,11 @@ def _adapter(tmp_path: Path, calls: Path) -> list[str]:
         f"p={str(calls)!r}\n"
         "trusted=json.load(sys.stdin)\n"
         "open(p,'a',encoding='utf-8').write(json.dumps({'argv':sys.argv[1:],'trusted':trusted,'secret_present':'HERMES_RELEASE_TEST_SECRET' in os.environ})+'\\n')\n"
-        "a=sys.argv; rid=a[a.index('--release-id')+1]\n"
+        "a=sys.argv; rid=a[a.index('--release-id')+1]; task=a[a.index('--task-id')+1]; manifest=a[a.index('--manifest-sha256')+1]\n"
         "op=a[a.index('--operation-key')+1]\n"
-        "print(json.dumps({'ok':True,'contract_version':'cuto-hermes-release/v1','operation_key':op,'release_id':rid,'dev':{'result':'success','active_release_id':rid},"
+        "print(json.dumps({'ok':True,'contract_version':'cuto-hermes-release/v1','operation_key':op,'task_id':task,'release_id':rid,'manifest_sha256':manifest,'manual_test_cases_sha256':'b'*64,'source_commit':'c'*40,'workflow_run_id':'123','bundle_sha256':'d'*64,'artifacts':{'php':{'sha256':'e'*64},'react':{'sha256':'f'*64},'caddy':{'sha256':'1'*64}},'dev':{'result':'success','active_release_id':rid},"
         "'test':{'result':'success','active_release_id':rid},'production':{'result':'success','active_release_id':rid},"
-        "'previous_release_id':'2026.09.17-02+old','rollback_available':True}))\n"
+        "'previous_release_id':'2026.09.17-02+old','rollback_available':True,'database_restore_attempted':False}))\n"
     )
     return [sys.executable, str(script), "literal ; $(not-shell)"]
 
@@ -69,6 +72,44 @@ def _approve(conn, argv, *, message="m1", now=100):
         promotion_argv=argv,
         now=now,
     )
+
+
+def _receipt(command, **changes):
+    release_id = command[command.index("--release-id") + 1]
+    receipt = {
+        "ok": True,
+        "contract_version": "cuto-hermes-release/v1",
+        "operation_key": command[command.index("--operation-key") + 1],
+        "task_id": command[command.index("--task-id") + 1],
+        "release_id": release_id,
+        "manifest_sha256": command[command.index("--manifest-sha256") + 1],
+        "manual_test_cases_sha256": "b" * 64,
+        "source_commit": "c" * 40,
+        "workflow_run_id": "123",
+        "bundle_sha256": "d" * 64,
+        "artifacts": {
+            "php": {"sha256": "e" * 64},
+            "react": {"sha256": "f" * 64},
+            "caddy": {"sha256": "1" * 64},
+        },
+        "dev": {"result": "success", "active_release_id": release_id},
+        "test": {"result": "success", "active_release_id": release_id},
+        "production": {"result": "success", "active_release_id": release_id},
+        "previous_release_id": "2026.09.17-02+old",
+        "rollback_available": True,
+        "database_restore_attempted": False,
+    }
+    receipt.update(changes)
+    return receipt
+
+
+def _receipt_adapter(monkeypatch, mutate):
+    def adapter(command, **_kwargs):
+        receipt = _receipt(command)
+        mutate(receipt)
+        return type("Completed", (), {"stdout": json.dumps(receipt)})()
+
+    monkeypatch.setattr("hermes_cli.kanban_release_approval.subprocess.run", adapter)
 
 
 def test_release_approval_is_bound_and_executes_literal_argv(tmp_path, monkeypatch):
@@ -260,18 +301,7 @@ def test_present_release_cannot_replace_claimed_task_from_another_route(tmp_path
         calls.append(command)
         adapter_started.set()
         assert release_adapter.wait(timeout=5)
-        release_id = command[command.index("--release-id") + 1]
-        receipt = {
-            "ok": True,
-            "contract_version": "cuto-hermes-release/v1",
-            "operation_key": command[command.index("--operation-key") + 1],
-            "release_id": release_id,
-            "dev": {"result": "success", "active_release_id": release_id},
-            "test": {"result": "success", "active_release_id": release_id},
-            "production": {"result": "success", "active_release_id": release_id},
-            "previous_release_id": "2026.09.17-02+old",
-            "rollback_available": True,
-        }
+        receipt = _receipt(command)
         return type("Completed", (), {"stdout": json.dumps(receipt)})()
 
     monkeypatch.setattr("hermes_cli.kanban_release_approval.subprocess.run", blocked_adapter)
@@ -363,18 +393,7 @@ def test_ambiguous_adapter_failure_stays_consuming_and_retries_as_resume(tmp_pat
         commands.append(command)
         if len(commands) == 1:
             raise OSError("adapter connection lost")
-        release_id = command[command.index("--release-id") + 1]
-        receipt = {
-            "ok": True,
-            "contract_version": "cuto-hermes-release/v1",
-            "operation_key": command[command.index("--operation-key") + 1],
-            "release_id": release_id,
-            "dev": {"result": "success", "active_release_id": release_id},
-            "test": {"result": "success", "active_release_id": release_id},
-            "production": {"result": "success", "active_release_id": release_id},
-            "previous_release_id": "release-old",
-            "rollback_available": True,
-        }
+        receipt = _receipt(command)
         return type("Completed", (), {"stdout": json.dumps(receipt)})()
 
     monkeypatch.setattr("hermes_cli.kanban_release_approval.subprocess.run", flaky_adapter)
@@ -414,16 +433,9 @@ def test_success_without_rollback_evidence_reports_unknown(tmp_path, monkeypatch
     kb.init_db()
 
     def adapter_without_rollback(command, **_kwargs):
-        release_id = command[command.index("--release-id") + 1]
-        receipt = {
-            "ok": True,
-            "contract_version": "cuto-hermes-release/v1",
-            "operation_key": command[command.index("--operation-key") + 1],
-            "release_id": release_id,
-            "dev": {"result": "success", "active_release_id": release_id},
-            "test": {"result": "success", "active_release_id": release_id},
-            "production": {"result": "success", "active_release_id": release_id},
-        }
+        receipt = _receipt(command)
+        receipt.pop("previous_release_id")
+        receipt.pop("rollback_available")
         return type("Completed", (), {"stdout": json.dumps(receipt)})()
 
     monkeypatch.setattr(
@@ -434,7 +446,7 @@ def test_success_without_rollback_evidence_reports_unknown(tmp_path, monkeypatch
         _present(conn, task)
         result = _approve(conn, ["adapter"], now=100)
 
-    assert result.ok
+    assert not result.ok and result.classification == "adapter_failed"
     assert result.previous_release_id is None
     assert result.rollback_available is None
     assert "Vorgänger: unbekannt" in result.user_message()
@@ -449,26 +461,12 @@ def test_verified_test_failure_stops_before_production_and_is_resumable(tmp_path
     def adapter(command, **kwargs):
         trusted = json.loads(kwargs["input"])
         calls.append((command, trusted))
-        release_id = command[command.index("--release-id") + 1]
-        operation_key = command[command.index("--operation-key") + 1]
         successful = len(calls) == 2
-        receipt = {
-            "ok": True,
-            "contract_version": "cuto-hermes-release/v1",
-            "operation_key": operation_key,
-            "release_id": release_id,
-            "dev": {"result": "success", "active_release_id": release_id},
-            "test": {
-                "result": "success" if successful else "failed",
-                "active_release_id": release_id,
-            },
-            "production": {
-                "result": "success" if successful else "not_started",
-                "active_release_id": release_id if successful else None,
-            },
-            "previous_release_id": "release-old",
-            "rollback_available": True,
-        }
+        receipt = _receipt(command)
+        if not successful:
+            previous = receipt["previous_release_id"]
+            receipt["test"] = {"result": "failed", "active_release_id": previous}
+            receipt["production"] = {"result": "not_started", "active_release_id": previous}
         return type("Completed", (), {"stdout": json.dumps(receipt)})()
 
     monkeypatch.setattr("hermes_cli.kanban_release_approval.subprocess.run", adapter)
@@ -497,19 +495,12 @@ def test_verified_production_failure_reports_compensated_active_release(tmp_path
     kb.init_db()
 
     def adapter(command, **_kwargs):
-        release_id = command[command.index("--release-id") + 1]
-        operation_key = command[command.index("--operation-key") + 1]
-        return type("Completed", (), {"stdout": json.dumps({
-            "ok": True,
-            "contract_version": "cuto-hermes-release/v1",
-            "operation_key": operation_key,
-            "release_id": release_id,
-            "dev": {"result": "success", "active_release_id": release_id},
-            "test": {"result": "success", "active_release_id": release_id},
-            "production": {"result": "failed", "active_release_id": "release-old"},
-            "previous_release_id": "release-old",
-            "rollback_available": True,
-        })})()
+        receipt = _receipt(command)
+        receipt["production"] = {
+            "result": "failed",
+            "active_release_id": receipt["previous_release_id"],
+        }
+        return type("Completed", (), {"stdout": json.dumps(receipt)})()
 
     monkeypatch.setattr("hermes_cli.kanban_release_approval.subprocess.run", adapter)
     with connect() as conn:
@@ -519,9 +510,112 @@ def test_verified_production_failure_reports_compensated_active_release(tmp_path
 
     assert not result.ok and result.classification == "promotion_failed"
     assert result.production_result == "failed"
-    assert result.active_release_id == "release-old"
-    assert result.previous_release_id == "release-old"
+    assert result.active_release_id == "2026.09.17-02+old"
+    assert result.previous_release_id == "2026.09.17-02+old"
     assert result.rollback_available is True
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda receipt: receipt.update({
+            "test": {"result": "failed", "active_release_id": "release-old"},
+        }),
+        lambda receipt: receipt.update({
+            "production": {
+                "result": "failed",
+                "active_release_id": receipt["release_id"],
+            },
+        }),
+        lambda receipt: receipt.update({
+            "manifest_sha256": "9" * 64,
+            "manual_test_cases_sha256": "8" * 64,
+            "artifacts": {"php": {"sha256": "7" * 64}},
+            "previous_release_id": "chosen-by-caller",
+            "database_restore_attempted": True,
+        }),
+    ],
+    ids=(
+        "test-failed-production-success",
+        "production-failed-candidate-still-active",
+        "unbound-identities-and-database-restore",
+    ),
+)
+def test_contradictory_or_unbound_receipts_fail_closed(
+    tmp_path, monkeypatch, mutate
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+    kb.init_db()
+    _receipt_adapter(monkeypatch, mutate)
+    with connect() as conn:
+        task = kb.create_task(conn, title="Invalid receipt")
+        gate = _present(conn, task)
+        result = _approve(conn, ["adapter"], now=100)
+        persisted = conn.execute(
+            "SELECT g.gate_status,s.state,s.error_class,s.adapter_receipt "
+            "FROM kanban_release_gates g JOIN kanban_release_sagas s ON s.gate_id=g.id "
+            "WHERE g.id=?",
+            (gate.gate_id,),
+        ).fetchone()
+
+    assert not result.ok and result.classification == "adapter_failed"
+    assert tuple(persisted) == ("consuming", "promoting", "adapter", None)
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda receipt: receipt.update({"unexpected_security_claim": True}),
+        lambda receipt: receipt["production"].update({"compensated": True}),
+        lambda receipt: receipt["artifacts"]["php"].update({"path": "/replacement"}),
+    ],
+    ids=("top-level", "target", "artifact"),
+)
+def test_unknown_receipt_security_fields_fail_closed(tmp_path, monkeypatch, mutate):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+    kb.init_db()
+    _receipt_adapter(monkeypatch, mutate)
+    with connect() as conn:
+        task = kb.create_task(conn, title="Unknown receipt field")
+        _present(conn, task)
+        result = _approve(conn, ["adapter"], now=100)
+
+    assert not result.ok and result.classification == "adapter_failed"
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda receipt: receipt.update({"contract_version": "cuto-hermes-release/v2"}),
+        lambda receipt: receipt.update({"operation_key": "release-approval:" + "4" * 64}),
+        lambda receipt: receipt.update({"task_id": "replacement-task"}),
+        lambda receipt: receipt.update({"release_id": "replacement-release"}),
+        lambda receipt: receipt.update({"manifest_sha256": "9" * 64}),
+        lambda receipt: receipt.update({"manual_test_cases_sha256": "8" * 64}),
+        lambda receipt: receipt.update({"source_commit": "7" * 40}),
+        lambda receipt: receipt.update({"bundle_sha256": "6" * 64}),
+        lambda receipt: receipt["artifacts"]["php"].update({"sha256": "5" * 64}),
+        lambda receipt: receipt.update({"previous_release_id": "caller-selected"}),
+        lambda receipt: receipt.update({"database_restore_attempted": True}),
+    ],
+    ids=(
+        "contract-version", "operation-key", "task", "release", "manifest",
+        "manual-tests", "source-commit", "bundle", "artifact", "previous-release",
+        "database-restore",
+    ),
+)
+def test_receipt_identity_substitution_and_restore_claims_fail_closed(
+    tmp_path, monkeypatch, mutate
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+    kb.init_db()
+    _receipt_adapter(monkeypatch, mutate)
+    with connect() as conn:
+        task = kb.create_task(conn, title="Receipt identity")
+        _present(conn, task)
+        result = _approve(conn, ["adapter"], now=100)
+
+    assert not result.ok and result.classification == "adapter_failed"
 
 
 def test_parallel_double_delivery_invokes_adapter_once(tmp_path, monkeypatch):

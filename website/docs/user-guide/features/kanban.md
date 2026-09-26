@@ -103,8 +103,9 @@ kanban:
 
 The release publisher first calls
 `hermes_cli.kanban_release_approval.present_release(...)` with the task,
-immutable release/manifest/manual-test digests, authenticated actor/route, and
-the ID of the message that visibly presented the release. Approval must reply
+immutable release, source commit, manifest, bundle, artifact, and manual-test
+digests, authenticated actor/route, and the ID of the message that visibly
+presented the release. Approval must reply
 to that exact message. A replacement presentation supersedes the old gate.
 Publishers call `update_release_state(...)` whenever workflow state, active Dev
 release, or manifest changes, so approval-time checks use current state rather
@@ -126,16 +127,21 @@ promote|resume --task-id ... --release-id ... --manifest-sha256 ... --operation-
 
 Hermes sends contract `cuto-hermes-release/v1`, the claims-bound actor subject,
 the manual-test digest, and a dispatcher-owned approval ID as bounded JSON on
-stdin, never as shell text or caller-selected argv. The adapter returns
-contract/version and operation-key echoes plus read-back state for Dev, Test,
-and Production, the actual active release, the verified predecessor, and
-rollback availability. All three targets and their active release IDs must be
-successful before Hermes records approval.
+stdin, never as shell text or caller-selected argv. The adapter returns an exact
+`cuto-hermes-release/v1` receipt: task, release, operation key,
+manifest/manual-test/bundle/artifact digests, source commit, canonical workflow
+run, exact Dev/Test/Production read-back, verified predecessor/rollback state,
+and `database_restore_attempted: false`. Unknown fields, omitted fields, digest
+or source substitutions, and values that differ from the immutable gate fail
+closed. All three targets and their active release IDs must be successful before
+Hermes records approval.
 
 The external boundary owns the ordered deployment policy: a failed Test smoke
 must leave Production `not_started`; a failed Production smoke must compensate
-to the verified predecessor and report that actual active release. Neither
-Hermes nor this approval contract performs an automatic database restore.
+to the gate-bound verified predecessor and report that actual active release.
+Hermes rejects a failed Production result while the candidate remains active,
+and rejects any receipt claiming a database restore. Neither Hermes nor this
+approval contract performs an automatic database restore.
 Stale, replayed, ambiguous, non-control, and concurrent approvals fail closed.
 SQLite claim/finalize transactions plus the idempotent adapter form a persisted
 saga, not a distributed ACID transaction. User-visible success is
